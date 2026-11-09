@@ -31,6 +31,7 @@ const attemptLifetimeMilliseconds = 10 * 60 * 1_000;
 const providerFailureMessage =
   "The configured identity provider could not complete browser login.";
 const countRowSchema = z.object({total: z.number().int().nonnegative()});
+const providerRowSchema = z.object({provider: z.string()});
 const failureSchema = z.object({
   error: z.object({code: z.string(), message: z.string()}),
 });
@@ -44,6 +45,30 @@ describe("OIDC id_token validation", () => {
   let provider: RunningStubOidcProvider;
   let server: RunningTestServer;
   let applicationOrigin: string;
+  let port: number;
+
+  /** Serve this installation through a fresh provider for one issuer form. */
+  async function serveIssuer(configuredIssuer: string): Promise<void> {
+    await server.stop();
+    server = await startOidcServer(configuredIssuer);
+  }
+
+  function startOidcServer(configuredIssuer: string): Promise<RunningTestServer> {
+    return startTestServer(installation, {
+      applicationOrigin,
+      bootstrapAdministratorEmail: administratorEmail,
+      browserAccess: privateTeamBrowserAccess(browserLoginKinds.oidc),
+      clock,
+      interactiveIdentityProvider: new OidcIdentityProvider({
+        clientId: provider.clientId,
+        clientSecret: null,
+        issuer: configuredIssuer,
+        redirectUri: `${applicationOrigin}/auth/callback`,
+        scopes,
+      }),
+      port,
+    });
+  }
 
   beforeEach(async () => {
     installation = await createTestInstallation();
@@ -52,22 +77,9 @@ describe("OIDC id_token validation", () => {
     });
     provider.claims.email = administratorEmail;
     clock = new MutableClock("2026-08-18T09:00:00.000Z");
-    const port = await reserveLoopbackPort();
+    port = await reserveLoopbackPort();
     applicationOrigin = `http://127.0.0.1:${port}`;
-    server = await startTestServer(installation, {
-      applicationOrigin,
-      bootstrapAdministratorEmail: administratorEmail,
-      browserAccess: privateTeamBrowserAccess(browserLoginKinds.oidc),
-      clock,
-      interactiveIdentityProvider: new OidcIdentityProvider({
-        clientId: provider.clientId,
-        clientSecret: null,
-        issuer: provider.issuer,
-        redirectUri: `${applicationOrigin}/auth/callback`,
-        scopes,
-      }),
-      port,
-    });
+    server = await startOidcServer(provider.issuer);
   });
 
   afterEach(async () => {
@@ -111,7 +123,19 @@ describe("OIDC id_token validation", () => {
     expect(redirected.status).toBe(303);
     expect(redirected.headers.get("location")).toBe("/api/v1/session");
 
+    // Authentik publishes its issuer with a trailing slash and signs exactly
+    // that value into `iss`. Whether the operator copies the issuer with or
+    // without the slash, login completes under the binding recorded above.
+    const published = `${provider.issuer}/`;
+    provider.defects.discoveryIssuer = published;
+    provider.claims.issuer = published;
+    await serveIssuer(published);
+    expect(await signedInMember(server.baseUrl)).toBe(admitted.principal.id);
+    await serveIssuer(provider.issuer);
+    expect(await signedInMember(server.baseUrl)).toBe(admitted.principal.id);
+
     expect(rowCount(installation, "installation_members")).toBe(1);
+    expect(identityProviders(installation)).toEqual([`oidc:${provider.issuer}`]);
   });
 
   test("AUTH-020-F: every token, state, and attempt defect is refused without a session, a member, or a leaked credential", async () => {
@@ -133,6 +157,10 @@ describe("OIDC id_token validation", () => {
     expect(replayed.headers.getSetCookie()).toEqual([]);
 
     provider.claims.issuer = "https://issuer.example.test";
+    await expectProviderRefusalFor(server.baseUrl);
+    // The issuer comparison is exact in both directions: a trailing slash the
+    // discovered issuer does not carry is a different issuer.
+    provider.claims.issuer = `${provider.issuer}/`;
     await expectProviderRefusalFor(server.baseUrl);
     provider.claims.issuer = null;
 
@@ -186,6 +214,17 @@ describe("OIDC id_token validation", () => {
     });
     expect(expired.status).toBe(401);
     expect(expired.headers.getSetCookie()).toEqual([]);
+
+    // An issuer published with a trailing slash refuses an `iss` without one,
+    // and still refuses an unrelated issuer.
+    provider.defects.discoveryIssuer = `${provider.issuer}/`;
+    await serveIssuer(provider.issuer);
+    provider.claims.issuer = provider.issuer;
+    await expectProviderRefusalFor(server.baseUrl);
+    provider.claims.issuer = "https://issuer.example.test/";
+    await expectProviderRefusalFor(server.baseUrl);
+    provider.claims.issuer = null;
+    provider.defects.discoveryIssuer = null;
 
     expect(rowCount(installation, "installation_members")).toBe(0);
     expect(rowCount(installation, "external_identities")).toBe(0);
@@ -293,6 +332,16 @@ async function expectProviderRefusal(
   });
 }
 
+/** Complete one login and return the member its session belongs to. */
+async function signedInMember(baseUrl: string): Promise<string> {
+  const login = await completeStubLogin(baseUrl);
+  expect(login.status).toBe(303);
+  const session = await fetch(`${baseUrl}/api/v1/session`, {
+    headers: {Cookie: applicationCookieHeader(login.headers.getSetCookie())},
+  });
+  return sessionResponseSchema.parse(await session.json()).principal.id;
+}
+
 async function completeStubLogin(baseUrl: string): Promise<Response> {
   const authorization = await startStubOidcLogin(baseUrl);
   return fetch(authorization.callbackUrl, {
@@ -319,6 +368,20 @@ function applicationCookieHeader(setCookieHeaders: readonly string[]): string {
     throw new Error("The login response did not issue both application cookies.");
   }
   return pairs.join("; ");
+}
+
+function identityProviders(installation: TestInstallation): readonly string[] {
+  const database = new DatabaseSync(
+    path.join(installation.dataDirectory, "artifact-server.db"),
+    {readOnly: true},
+  );
+  try {
+    return providerRowSchema.array().parse(
+      database.prepare("SELECT provider FROM external_identities").all(),
+    ).map((row) => row.provider);
+  } finally {
+    database.close();
+  }
 }
 
 function rowCount(installation: TestInstallation, table: string): number {

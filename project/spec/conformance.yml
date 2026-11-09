@@ -1578,8 +1578,8 @@ requirements:
     owner: authorization
     source: {file: oidc-interactive-login-spec.md, anchor: conformance}
     acceptance:
-      behavior: {id: AUTH-020-B, description: "Valid logins succeed under a thirty-second clock skew, and a returnTo that only becomes scheme-relative after path normalization still lands on an application path."}
-      failure: {id: AUTH-020-F, description: "Wrong signature, wrong issuer, wrong audience, expired token, replayed or unknown state, expired attempt, wrong nonce, and a callback presented without the handshake cookie minted at /auth/login are each refused; no session or member is created; codes and tokens never appear in logs."}
+      behavior: {id: AUTH-020-B, description: "Valid logins succeed under a thirty-second clock skew, an issuer published with a trailing slash verifies id_tokens against exactly that issuer under the binding recorded without it, and a returnTo that only becomes scheme-relative after path normalization still lands on an application path."}
+      failure: {id: AUTH-020-F, description: "Wrong signature, wrong issuer including one that differs from the discovered issuer only by a trailing slash, wrong audience, expired token, replayed or unknown state, expired attempt, wrong nonce, and a callback presented without the handshake cookie minted at /auth/login are each refused; no session or member is created; codes and tokens never appear in logs."}
     deployments: *all
     status: behavior_verified
     depends_on: [AUTH-019]

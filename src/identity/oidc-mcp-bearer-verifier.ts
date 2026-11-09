@@ -66,6 +66,7 @@ export interface OidcMcpBearerVerifierConfig {
   /** The exact MCP resource URL the issuer must bind into `aud`. */
   readonly audience: string;
   readonly fetch?: typeof globalThis.fetch;
+  /** The issuer exactly as discovery publishes it; `iss` must equal it. */
   readonly issuer: string;
   readonly jwksUri: string;
   readonly userInfoEndpoint?: string | null;
@@ -86,10 +87,12 @@ export class OidcMcpBearerVerifier implements ExternalMcpBearerVerifier {
     this.#audience = config.audience;
     const providerFetch = config.fetch ?? globalThis.fetch;
     this.#fetch = (input, init) => providerFetch(input, init);
-    this.#issuer = requireOidcIssuer(config.issuer, "The OIDC issuer");
-    // Browser login records the same provider name, so one person keeps one
-    // membership whether they arrive through the interface or through MCP.
-    this.#provider = `oidc:${this.#issuer}`;
+    // Tokens are compared with the published issuer, trailing slash included.
+    // Browser login records the same normalized provider name, so one person
+    // keeps one membership whether they arrive through the interface or MCP,
+    // and whether or not the issuer is published with a trailing slash.
+    this.#issuer = config.issuer;
+    this.#provider = `oidc:${requireOidcIssuer(config.issuer, "The OIDC issuer")}`;
     this.#userInfoEndpoint = config.userInfoEndpoint ?? null;
     this.#jwks = createRemoteJWKSet(new URL(config.jwksUri), {
       cacheMaxAge: jwksCacheMilliseconds,
