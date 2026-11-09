@@ -15,14 +15,19 @@ name: Container Image
 # embedded SPDX SBOM per platform, and the OCI label/metadata checks in
 # scripts/oci-image-metadata.mjs.
 #
-# Run it on demand for any branch, e.g.:
+# It runs on every push to the `patched` branch, and on demand for any branch:
 #   gh workflow run image.yml --ref <branch>
+# (GitHub only dispatches workflows whose file also exists on the default
+# branch; the push trigger is what makes this one run from a non-default
+# branch. Re-running a push run rebuilds that same commit.)
 # Tags: the full commit SHA and the sanitized ref name. Consumers should pin
 # the index digest printed in the job summary, and can verify it with:
 #   gh attestation verify oci://ghcr.io/<owner>/artifact-server@<digest> \
 #     --repo <owner>/artifact-server
 
 on:
+  push:
+    branches: [patched]
   workflow_dispatch:
 
 permissions:
