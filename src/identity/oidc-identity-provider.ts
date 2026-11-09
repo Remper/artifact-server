@@ -50,6 +50,7 @@ const idTokenClaimsSchema = z.looseObject({
 /** Validated OpenID Connect discovery endpoints for one issuer. */
 interface OidcDiscovery {
   readonly authorizationEndpoint: string;
+  /** The issuer exactly as discovery publishes it, which id_tokens carry. */
   readonly issuer: string;
   readonly jwksUri: string;
   readonly tokenEndpoint: string;
@@ -273,7 +274,10 @@ const loadDiscovery = Effect.fn("OidcIdentityProvider.loadDiscovery")(
     }
     const discovery: OidcDiscovery = {
       authorizationEndpoint,
-      issuer,
+      // OIDC Core 3.1.3.7 compares `iss` exactly with the issuer discovery
+      // publishes. Authentik publishes its issuer with a trailing slash, which
+      // the normalized configured issuer no longer carries.
+      issuer: document.data.issuer,
       jwksUri,
       tokenEndpoint,
     };

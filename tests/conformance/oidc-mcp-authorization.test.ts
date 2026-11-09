@@ -1,4 +1,6 @@
 import {createServer, type Server} from "node:http";
+import path from "node:path";
+import {DatabaseSync} from "node:sqlite";
 
 import {
   CLIENT_CAPABILITIES_META_KEY,
@@ -15,6 +17,7 @@ import {
 } from "jose";
 import {Effect, Predicate, Redacted} from "effect";
 import {afterEach, beforeEach, describe, expect, test} from "vitest";
+import {z} from "zod";
 
 import {createOidcHostedAuthentication} from
   "../../src/identity/oidc-hosted-authentication.js";
@@ -37,6 +40,7 @@ const realmPath = "/realms/artifact";
 const resource = "https://staging.artifactserver.test/mcp";
 const subject = "9f1d2c3b-0000-4000-8000-artifactserver";
 const userEmail = "administrator@example.test";
+const providerRowSchema = z.object({provider: z.string()});
 
 describe("generic OIDC MCP authorization", () => {
   let installation: TestInstallation;
@@ -95,6 +99,26 @@ describe("generic OIDC MCP authorization", () => {
         issuer: "https://attacker.example",
       }),
     })).rejects.toThrow("different issuer");
+    // A configured issuer may differ from the published one by a trailing
+    // slash, and the published form is what every token is checked against.
+    // Any other difference is still another issuer.
+    const published = `${issuer}/`;
+    const slashed = await Promise.all([issuer, published].map((configured) =>
+      loadOidcAuthorizationServer(configured, {
+        fetch: async () => documentResponse(discoveryDocument(issuer, published)),
+      })
+    ));
+    expect(slashed.map((loaded) => [loaded.issuer, loaded.metadata.issuer]))
+      .toEqual([[published, published], [published, published]]);
+    const others = [`${issuer}/other/`, issuer.replace(realmPath, "/")];
+    const refused = await Promise.allSettled(others.map((other) =>
+      loadOidcAuthorizationServer(published, {
+        fetch: async () => documentResponse(discoveryDocument(issuer, other)),
+      })
+    ));
+    expect(refused.map((result) => result.status === "rejected" &&
+      String(result.reason).includes("different issuer")))
+      .toEqual([true, true]);
     await expect(loadOidcAuthorizationServer(issuer, {
       fetch: async () => documentResponse({
         ...discoveryDocument(issuer),
@@ -149,6 +173,40 @@ describe("generic OIDC MCP authorization", () => {
     expect((await mcpDiscovery(token)).status).toBe(200);
 
     expect((await mcpDiscovery(installation.apiToken)).status).toBe(200);
+
+    // Authentik publishes its issuer with a trailing slash and signs exactly
+    // that value into `iss`. The same person keeps the same membership.
+    const published = `${issuer}/`;
+    provider.publishIssuer(published);
+    const hosted = await createOidcHostedAuthentication({
+      applicationOrigin: new URL(resource).origin,
+      clientId: "artifact-server",
+      clientSecret: null,
+      issuer: published,
+      scopes: "openid email profile",
+    });
+    await server.stop();
+    server = await startTestServer(installation, {
+      bootstrapAdministratorEmail: userEmail,
+      externalMcpOAuthVerifier: hosted.externalMcpOAuthVerifier,
+      mcpOAuthResource: hosted.mcpOAuthResource,
+    });
+    const slashedMetadata = await fetch(
+      `${server.baseUrl}/.well-known/oauth-protected-resource/mcp`,
+    );
+    expect(await slashedMetadata.json()).toMatchObject({
+      authorization_servers: [published],
+      resource,
+    });
+    const slashedServer = await fetch(
+      `${server.baseUrl}/.well-known/oauth-authorization-server`,
+    );
+    expect(await slashedServer.json()).toMatchObject({issuer: published});
+    expect((await mcpDiscovery(await issueToken({issuer: published}))).status)
+      .toBe(200);
+    expect(identityProviders(installation)).toEqual([`oidc:${issuer}`]);
+    // The comparison stays exact: the slash-free form is now another issuer.
+    expect((await mcpDiscovery(await issueToken({}))).status).toBe(401);
   });
 
   test("a lean token resolves its profile through userinfo exactly once", async () => {
@@ -221,6 +279,11 @@ describe("generic OIDC MCP authorization", () => {
 
     expect((await mcpDiscovery(await issueToken({
       issuer: "https://attacker.example",
+    }))).status).toBe(401);
+
+    // A trailing slash the published issuer does not carry is another issuer.
+    expect((await mcpDiscovery(await issueToken({
+      issuer: `${issuer}/`,
     }))).status).toBe(401);
 
     expect((await mcpDiscovery(await issueToken({
@@ -433,6 +496,8 @@ function verifiedSubject(
 interface ProviderBoundary {
   readonly issuer: string;
   close(): Promise<void>;
+  /** Publish the issuer in another form, as Authentik adds a trailing slash. */
+  publishIssuer(published: string): void;
   setKeysStatus(status: number): void;
   setUserInfoStatus(status: number): void;
   userInfoRequests(): number;
@@ -445,10 +510,13 @@ async function startProviderBoundary(options: {
   let userInfoRequestCount = 0;
   let userInfoStatus = 200;
   let issuer = "";
+  let publishedIssuer: string | null = null;
   const provider = createServer((request, response) => {
     if (request.url === `${realmPath}/.well-known/openid-configuration`) {
       response.setHeader("Content-Type", "application/json");
-      response.end(JSON.stringify(discoveryDocument(issuer)));
+      response.end(JSON.stringify(
+        discoveryDocument(issuer, publishedIssuer ?? issuer),
+      ));
       return;
     }
     if (request.url === `${realmPath}/protocol/openid-connect/certs`) {
@@ -495,6 +563,9 @@ async function startProviderBoundary(options: {
   return {
     close: () => close(provider),
     issuer,
+    publishIssuer: (published) => {
+      publishedIssuer = published;
+    },
     setKeysStatus: (status) => {
       keysStatus = status;
     },
@@ -511,12 +582,13 @@ async function exportedJwk(keyId: string): Promise<JWK> {
   return {...publicJwk, alg: "RS256", kid: keyId, use: "sig"};
 }
 
-function discoveryDocument(issuer: string) {
+/** Endpoints live under `issuer`; `published` is the issuer field itself. */
+function discoveryDocument(issuer: string, published = issuer) {
   return {
     authorization_endpoint: `${issuer}/protocol/openid-connect/auth`,
     code_challenge_methods_supported: ["S256"],
     grant_types_supported: ["authorization_code", "refresh_token"],
-    issuer,
+    issuer: published,
     jwks_uri: `${issuer}/protocol/openid-connect/certs`,
     registration_endpoint: `${issuer}/clients-registrations/openid-connect`,
     response_types_supported: ["code"],
@@ -533,6 +605,20 @@ function documentResponse(document: DiscoveryDocument): Response {
     headers: {"Content-Type": "application/json"},
     status: 200,
   });
+}
+
+function identityProviders(installation: TestInstallation): readonly string[] {
+  const database = new DatabaseSync(
+    path.join(installation.dataDirectory, "artifact-server.db"),
+    {readOnly: true},
+  );
+  try {
+    return providerRowSchema.array().parse(
+      database.prepare("SELECT provider FROM external_identities").all(),
+    ).map((row) => row.provider);
+  } finally {
+    database.close();
+  }
 }
 
 function listen(server: Server): Promise<void> {
