@@ -1,0 +1,186 @@
+name: Container Image
+
+# Builds the OCI image from packaging/oci/Dockerfile for the dispatched ref,
+# pushes it to this repository owner's GHCR namespace, and records signed
+# GitHub build-provenance and SBOM attestations against the image index digest.
+#
+# This workflow publishes only the container image and its attestations. It
+# never publishes npm packages, creates GitHub releases, or creates git tags;
+# that is what release.yml does for tagged upstream releases. It exists
+# separately because release.yml hard-codes the upstream registry namespace
+# and also carries npm and GitHub-release jobs that a fork should not arm.
+#
+# The image is built by scripts/build-oci-image.sh, the same path release.yml
+# uses: linux/amd64 + linux/arm64, BuildKit SLSA provenance (mode=max), an
+# embedded SPDX SBOM per platform, and the OCI label/metadata checks in
+# scripts/oci-image-metadata.mjs.
+#
+# Run it on demand for any branch, e.g.:
+#   gh workflow run image.yml --ref <branch>
+# Tags: the full commit SHA and the sanitized ref name. Consumers should pin
+# the index digest printed in the job summary, and can verify it with:
+#   gh attestation verify oci://ghcr.io/<owner>/artifact-server@<digest> \
+#     --repo <owner>/artifact-server
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build, push and attest OCI image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Checkout dispatched ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 10.34.3
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.15.0
+          package-manager-cache: false
+      - name: Install dependencies without a cache
+        # Needed by the metadata and SBOM extraction scripts, not the image.
+        run: pnpm install --frozen-lockfile
+      - name: Compute image name and tags
+        id: names
+        env:
+          ARTIFACTSERVER_OWNER: ${{ github.repository_owner }}
+          ARTIFACTSERVER_REF_NAME: ${{ github.ref_name }}
+          ARTIFACTSERVER_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The checkout must be exactly the commit the attestation will name.
+          if [[ "$(git rev-parse HEAD)" != "$ARTIFACTSERVER_SHA" ]]; then
+            printf 'Checked-out HEAD does not match github.sha.\n' >&2
+            exit 1
+          fi
+          # GHCR repository names must be lowercase.
+          name="ghcr.io/${ARTIFACTSERVER_OWNER,,}/artifact-server"
+          # Docker tags allow [A-Za-z0-9_.-], max 128 chars, no leading . or -.
+          ref_tag=$(printf '%s' "$ARTIFACTSERVER_REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[.-]*//' | cut -c1-128)
+          version=$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")
+          tags="$name:$ARTIFACTSERVER_SHA"
+          if [[ -n "$ref_tag" ]]; then
+            tags="$tags,$name:$ref_tag"
+          fi
+          {
+            printf 'name=%s\n' "$name"
+            printf 'tags=%s\n' "$tags"
+            printf 'version=%s\n' "$version"
+          } >> "$GITHUB_OUTPUT"
+      - name: Prepare attestation-capable BuildKit
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx create \
+            --driver docker-container \
+            --driver-opt image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 \
+            --name artifact-server-image \
+            --use
+          docker buildx inspect --bootstrap
+      - name: Sign in to GHCR
+        env:
+          ARTIFACTSERVER_GITHUB_ACTOR: ${{ github.actor }}
+          ARTIFACTSERVER_GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          docker login ghcr.io
+          --username "$ARTIFACTSERVER_GITHUB_ACTOR"
+          --password-stdin
+          <<< "$ARTIFACTSERVER_GITHUB_TOKEN"
+      - name: Build and push image
+        env:
+          ARTIFACT_SERVER_IMAGE_PUSH: "true"
+          ARTIFACT_SERVER_IMAGE_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          ARTIFACT_SERVER_IMAGE_TAGS: ${{ steps.names.outputs.tags }}
+        run: pnpm package:oci "$RUNNER_TEMP/image-work"
+      - name: Read image index digest
+        id: image
+        env:
+          ARTIFACTSERVER_VERSION: ${{ steps.names.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/image-work/artifact-server-$ARTIFACTSERVER_VERSION.oci.tar.manifest.json"
+          digest=$(jq --exit-status --raw-output '.imageIndexDigest' "$manifest")
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Verify pushed tags resolve to the built digest
+        env:
+          ARTIFACTSERVER_DIGEST: ${{ steps.image.outputs.digest }}
+          ARTIFACTSERVER_TAGS: ${{ steps.names.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a tags <<< "$ARTIFACTSERVER_TAGS"
+          for tag in "${tags[@]}"; do
+            actual="sha256:$(docker buildx imagetools inspect --raw "$tag" | sha256sum | cut -d ' ' -f 1)"
+            if [[ "$actual" != "$ARTIFACTSERVER_DIGEST" ]]; then
+              printf 'Pushed tag %s resolved to %s, expected %s.\n' \
+                "$tag" "$actual" "$ARTIFACTSERVER_DIGEST" >&2
+              exit 1
+            fi
+          done
+      - name: Extract per-platform SPDX SBOMs
+        env:
+          ARTIFACTSERVER_VERSION: ${{ steps.names.outputs.version }}
+        run: >-
+          scripts/generate-release-sboms.sh
+          unused
+          "$RUNNER_TEMP/image-work"
+          "$RUNNER_TEMP/image-sbom"
+          "$ARTIFACTSERVER_VERSION"
+          image
+      - name: Attest image provenance in GHCR
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.names.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+      - name: Attest amd64 image SBOM in GHCR
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.names.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/image-sbom/artifact-server-${{ steps.names.outputs.version }}-oci-linux-amd64.spdx.json
+          push-to-registry: true
+      - name: Attest arm64 image SBOM in GHCR
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.names.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/image-sbom/artifact-server-${{ steps.names.outputs.version }}-oci-linux-arm64.spdx.json
+          push-to-registry: true
+      - name: Record immutable image reference
+        env:
+          ARTIFACTSERVER_DIGEST: ${{ steps.image.outputs.digest }}
+          ARTIFACTSERVER_NAME: ${{ steps.names.outputs.name }}
+          ARTIFACTSERVER_SHA: ${{ github.sha }}
+          ARTIFACTSERVER_TAGS: ${{ steps.names.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '### Container image\n\n'
+            printf -- '- Commit: `%s`\n' "$ARTIFACTSERVER_SHA"
+            printf -- '- Reference: `%s@%s`\n' "$ARTIFACTSERVER_NAME" "$ARTIFACTSERVER_DIGEST"
+            printf -- '- Tags: `%s`\n' "$ARTIFACTSERVER_TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '%s@%s\n' "$ARTIFACTSERVER_NAME" "$ARTIFACTSERVER_DIGEST"
