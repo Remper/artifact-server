@@ -16,6 +16,7 @@ const anchorArtifact = `<!doctype html>
       body { margin: 0; }
       nav { position: fixed; top: 0; background: white; z-index: 1; }
       section { height: 1200px; padding-top: 80px; }
+      #section:target h2 { color: rgb(200, 0, 0); }
     </style>
   </head>
   <body>
@@ -29,12 +30,18 @@ const anchorArtifact = `<!doctype html>
       <a id="empty-link" href="#">Document start</a>
       <a id="top-link" href="#top">Top</a>
       <a id="owned-link" href="#section">Authored action</a>
+      <a id="tab-link" href="#tab-b">Tab B</a>
+      <svg width="120" height="20" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+        <a xlink:href="#svg-target"><text id="svg-link" x="0" y="15">SVG link</text></a>
+      </svg>
+      <p id="tab-panel">Tab A</p>
     </nav>
     <section><h1>Fragment links remain in the preview</h1></section>
     <section id="section"><h2>Nested target</h2></section>
     <section id="café [section]"><h2>Encoded target</h2></section>
     <section><a name="legacy">Legacy target</a></section>
     <section id="keyboard"><h2>Keyboard target</h2></section>
+    <section id="svg-target"><h2>SVG target</h2></section>
     <script>
       document.addEventListener("click", function (event) {
         if (event.target.id === "owned-link") {
@@ -42,6 +49,13 @@ const anchorArtifact = `<!doctype html>
           event.target.textContent = "Authored action handled";
         }
       });
+      var hashChanges = [];
+      window.addEventListener("hashchange", function () {
+        hashChanges.push(location.hash);
+        document.getElementById("tab-panel").textContent =
+          location.hash === "#tab-b" ? "Tab B" : "Tab A";
+      });
+      window.hashChanges = hashChanges;
       var dynamicLink = document.createElement("a");
       dynamicLink.id = "dynamic-link";
       dynamicLink.href = "#section";
@@ -52,7 +66,7 @@ const anchorArtifact = `<!doctype html>
 </html>`;
 
 test.describe("Review fragment links", () => {
-  test("CMT-022-B CMT-022-F: fragment links scroll within the sandbox and tolerate invalid targets without navigation", async ({browser}) => {
+  test("CMT-022-B CMT-022-F: fragment links navigate within the sandboxed document and tolerate invalid targets without leaving it", async ({browser}) => {
     const fixture = await startBrowserFixture(browser);
     try {
       const published = await publishNew(fixture.server, fixture.installation, {
@@ -92,6 +106,15 @@ test.describe("Review fragment links", () => {
 
       await preview.locator("#nested-link span").click();
       await expectTargetAtTop(preview, "#section");
+      expect(await previewHref(preview)).toBe("about:srcdoc#section");
+      expect(await preview.locator("#section h2").evaluate((element) =>
+        getComputedStyle(element).color)).toBe("rgb(200, 0, 0)");
+      await preview.locator("#tab-link").click();
+      await expect(preview.locator("#tab-panel")).toHaveText("Tab B");
+      expect(await previewHref(preview)).toBe("about:srcdoc#tab-b");
+      await preview.locator("#svg-link").click();
+      await expectTargetAtTop(preview, "#svg-target");
+      await expect(preview.locator("#tab-panel")).toHaveText("Tab A");
       await preview.locator("#encoded-link").click();
       await expectTargetAtTop(preview, '[id="café [section]"]');
       await preview.locator("#named-link").click();
@@ -116,13 +139,19 @@ test.describe("Review fragment links", () => {
       expect(await preview.locator("body").evaluate(() => window.scrollY)).toBe(0);
       await preview.locator("#dynamic-link").click();
       await expectTargetAtTop(preview, "#section");
+      expect(await preview.locator("body").evaluate(() =>
+        (window as unknown as {hashChanges: string[]}).hashChanges)).toEqual([
+        "#section", "#tab-b", "#svg-target", "#caf%C3%A9%20%5Bsection%5D", "#legacy",
+        "#keyboard", "#missing", "#bad%escape", "", "#section", "#top", "#section",
+      ]);
 
       await expect(preview.locator("h1")).toHaveText("Fragment links remain in the preview");
-      expect(navigations).toEqual([]);
+      expect(navigations.length).toBeGreaterThan(0);
+      for (const url of navigations) expect(url).toMatch(/^about:srcdoc#/u);
       expect(documentRequests).toEqual([]);
       expect(browserErrors).toEqual([]);
       expect(fixture.page.url()).toBe(reviewUrl);
-      expect(await preview.locator("body").evaluate(() => window.location.href)).toBe(previewUrl);
+      expect(await previewHref(preview)).toBe(`${previewUrl}#section`);
     } finally {
       await stopBrowserFixture(fixture);
     }
@@ -169,4 +198,8 @@ async function expectTargetAtTop(preview: FrameLocator, selector: string): Promi
   await expect.poll(() => preview.locator(selector).evaluate((element) =>
     Math.abs(element.getBoundingClientRect().top)
   )).toBeLessThan(2);
+}
+
+async function previewHref(preview: FrameLocator): Promise<string> {
+  return preview.locator("body").evaluate(() => window.location.href);
 }

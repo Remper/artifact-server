@@ -4,6 +4,15 @@
  * Listen after element/document handlers so authored and annotation gestures
  * that cancel a click keep ownership of it.
  *
+ * A fragment link is followed as a same-document navigation of about:srcdoc by
+ * assigning `location.hash`. The hash setter resolves against the document's
+ * own URL, not the injected base, so nothing is requested from the content
+ * host, while the browser still does everything an in-page link normally does:
+ * `hashchange` fires (artifacts that switch tabs on it keep working), `:target`
+ * styles apply, the indicated element or legacy named anchor is scrolled into
+ * view. `history.replaceState` and
+ * `location.replace` would resolve against the base and leave the document.
+ *
  * This function is serialized into an inline script and must be self-contained.
  */
 export function installFragmentLinks(): void {
@@ -14,17 +23,28 @@ export function installFragmentLinks(): void {
     ) return;
     const element = event.target;
     if (!(element instanceof Element)) return;
-    const link = element.closest("a[href]");
-    if (!(link instanceof HTMLAnchorElement) || link.hasAttribute("download")) return;
+    // HTML links, and SVG links in charts and diagrams, which may still use
+    // the legacy xlink:href attribute.
+    const link = element.closest("a[href], a[*|href]");
+    if (link === null || link.hasAttribute("download")) return;
     const target = link.getAttribute("target")
       ?? document.querySelector("base[target]")?.getAttribute("target")
       ?? "";
     if (target !== "" && target.toLowerCase() !== "_self") return;
-    const href = link.getAttribute("href")?.trim();
-    if (href === undefined || !href.startsWith("#")) return;
+    const href = (
+      link.getAttribute("href")
+      ?? link.getAttributeNS("http://www.w3.org/1999/xlink", "href")
+    )?.trim();
+    if (href === undefined || href === null || !href.startsWith("#")) return;
 
     // Missing and malformed targets must not navigate to the base URL either.
     event.preventDefault();
+    try {
+      window.location.hash = href;
+      return;
+    } catch {
+      // Fall back to scrolling without a navigation.
+    }
     let fragment = href.slice(1);
     try {
       fragment = decodeURIComponent(fragment);

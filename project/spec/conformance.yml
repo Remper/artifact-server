@@ -2558,15 +2558,15 @@ requirements:
 
   - id: CMT-022
     kind: behavior
-    behavior: Ordinary same-frame fragment-only links in HTML Review previews scroll within the rendered document without navigating to the injected resource base or weakening sandbox isolation.
+    behavior: Ordinary same-frame fragment-only links in HTML Review previews, including SVG links, navigate within the rendered document (fragment URL, hashchange, :target, scrolling) without navigating to the injected resource base or weakening sandbox isolation.
     owner: artifact-comments
     source: {file: artifact-comments-spec.md, anchor: html-fragment-navigation}
     acceptance:
-      behavior: {id: CMT-022-B, description: "In Interact mode, activate nested, encoded, legacy named, and keyboard fragment links and observe the target within the same sandboxed document; empty and top fragments return to the document start with no navigation request."}
+      behavior: {id: CMT-022-B, description: "In Interact mode, activate nested, encoded, legacy named, SVG, and keyboard fragment links and observe the target, the fragment on the preview URL, hashchange-driven content, and :target within the same sandboxed document; empty and top fragments return to the document start with no document request."}
       failure: {id: CMT-022-F, description: "Missing and malformed fragment targets cause no navigation or script error, authored element and document cancellation retains control, and Annotate mode can save a comment on a link without scrolling or weakening the opaque-origin sandbox."}
     deployments: *all
     status: behavior_verified
-    proof_gap: Local Chromium production-build evidence proves fragment scrolling, cancellation, annotation ownership, and retained sandbox isolation. Equivalent Firefox, WebKit, and team-deployment evidence remains unrecorded; URL hash and history emulation are outside this contract.
+    proof_gap: Local Chromium production-build evidence proves fragment navigation and scrolling, cancellation, annotation ownership, and retained sandbox isolation. Equivalent Firefox, WebKit, and team-deployment evidence remains unrecorded.
     depends_on: [CMT-014, CMT-018]
     evidence:
       - deployment: local
