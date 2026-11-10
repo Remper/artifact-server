@@ -35,6 +35,7 @@ const anchorArtifact = `<!doctype html>
         <a xlink:href="#svg-target"><text id="svg-link" x="0" y="15">SVG link</text></a>
       </svg>
       <p id="tab-panel">Tab A</p>
+      <output id="hash-log"></output>
     </nav>
     <section><h1>Fragment links remain in the preview</h1></section>
     <section id="section"><h2>Nested target</h2></section>
@@ -52,10 +53,10 @@ const anchorArtifact = `<!doctype html>
       var hashChanges = [];
       window.addEventListener("hashchange", function () {
         hashChanges.push(location.hash);
+        document.getElementById("hash-log").textContent = hashChanges.join(" ");
         document.getElementById("tab-panel").textContent =
           location.hash === "#tab-b" ? "Tab B" : "Tab A";
       });
-      window.hashChanges = hashChanges;
       var dynamicLink = document.createElement("a");
       dynamicLink.id = "dynamic-link";
       dynamicLink.href = "#section";
@@ -139,11 +140,10 @@ test.describe("Review fragment links", () => {
       expect(await preview.locator("body").evaluate(() => window.scrollY)).toBe(0);
       await preview.locator("#dynamic-link").click();
       await expectTargetAtTop(preview, "#section");
-      expect(await preview.locator("body").evaluate(() =>
-        (window as unknown as {hashChanges: string[]}).hashChanges)).toEqual([
+      await expect(preview.locator("#hash-log")).toHaveText([
         "#section", "#tab-b", "#svg-target", "#caf%C3%A9%20%5Bsection%5D", "#legacy",
         "#keyboard", "#missing", "#bad%escape", "", "#section", "#top", "#section",
-      ]);
+      ].join(" "));
 
       await expect(preview.locator("h1")).toHaveText("Fragment links remain in the preview");
       expect(navigations.length).toBeGreaterThan(0);
